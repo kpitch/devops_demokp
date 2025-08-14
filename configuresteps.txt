@@ -1,0 +1,150 @@
+tep-by-Step Implementation Guide
+Phase 1: Prerequisites Setup
+
+Azure Account Setup
+bash# Install Azure CLI
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+# Login to Azure
+az login
+
+# Set subscription
+az account set --subscription "your-subscription-id"
+
+Tools Installation
+bash# Install Terraform
+wget https://releases.hashicorp.com/terraform/1.5.0/terraform_1.5.0_linux_amd64.zip
+unzip terraform_1.5.0_linux_amd64.zip
+sudo mv terraform /usr/local/bin/
+
+# Install kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/
+
+# Install Docker
+sudo apt-get update
+sudo apt-get install docker.io
+sudo usermod -aG docker $USER
+
+# Install Ansible
+sudo apt-get install ansible
+pip3 install kubernetes
+
+
+Phase 2: Infrastructure Provisioning
+
+Initialize Terraform
+bashcd terraform/
+terraform init
+terraform plan
+terraform apply
+
+Configure kubectl
+bash# Get AKS credentials
+az aks get-credentials --resource-group rg-myapi-prod --name aks-myapi-prod
+
+# Verify connection
+kubectl get nodes
+
+
+Phase 3: Application Setup
+
+Build and Test Locally
+bash# Install dependencies
+npm install
+
+# Run tests
+npm test
+
+# Build Docker image
+docker build -t myapi:latest .
+
+# Test locally
+docker-compose up
+
+Push to ACR
+bash# Login to ACR
+az acr login --name acrmyapiprod
+
+# Tag and push
+docker tag myapi:latest acrmyapiprod.azurecr.io/myapi:latest
+docker push acrmyapiprod.azurecr.io/myapi:latest
+
+
+Phase 4: Jenkins Setup
+
+Install Jenkins
+bash# Install Jenkins
+wget -q -O - https://pkg.jenkins.io/debian/jenkins.io.key | sudo apt-key add -
+sudo sh -c 'echo deb http://pkg.jenkins.io/debian-stable binary/ > /etc/apt/sources.list.d/jenkins.list'
+sudo apt-get update
+sudo apt-get install jenkins
+
+# Start Jenkins
+sudo systemctl start jenkins
+sudo systemctl enable jenkins
+
+Configure Jenkins
+
+Install required plugins: Docker, Azure CLI, Kubernetes CLI, Ansible
+Add credentials: Azure service principal, ACR credentials, kubeconfig
+Create multibranch pipeline pointing to your Git repository
+
+
+
+Phase 5: Deployment
+
+Deploy using Ansible
+bash# Test Ansible connection
+ansible all -m ping -i ansible/inventory.ini
+
+# Deploy application
+ansible-playbook ansible/playbook.yml \
+    -e acr_name=acrmyapiprod \
+    -e image_tag=latest \
+    -e namespace=production
+
+Verify Deployment
+bash# Check pods
+kubectl get pods -n production
+
+# Check services
+kubectl get svc -n production
+
+# Check ingress
+kubectl get ingress -n production
+
+# Test health endpoint
+curl https://api.yourdomain.com/health
+
+
+Phase 6: Monitoring and Scaling
+
+Set up monitoring
+bash# Install Prometheus and Grafana
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install prometheus prometheus-community/kube-prometheus-stack
+
+Configure auto-scaling
+bash# Apply HPA
+kubectl apply -f - <<EOF
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myapi-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapi-deployment
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+EOF

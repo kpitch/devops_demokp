@@ -1,0 +1,181 @@
+pipeline {
+    agent any
+    
+    environment {
+        AZURE_SUBSCRIPTION_ID = credentials('azure-subscription-id')
+        AZURE_CLIENT_ID = credentials('azure-client-id')
+        AZURE_CLIENT_SECRET = credentials('azure-client-secret')
+        AZURE_TENANT_ID = credentials('azure-tenant-id')
+        ACR_NAME = 'acrmyapiprod'
+        IMAGE_NAME = 'myapi'
+        KUBECONFIG = credentials('kubeconfig')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Build and Test') {
+            steps {
+                script {
+                    // Install dependencies and run tests
+                    sh 'npm ci'
+                    sh 'npm test'
+                    sh 'npm run lint'
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                script {
+                    // Run security audit
+                    sh 'npm audit --audit-level moderate'
+                    
+                    // Scan Docker image for vulnerabilities
+                    sh 'docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${BUILD_NUMBER} || true'
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    // Build Docker image
+                    def image = docker.build("${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${BUILD_NUMBER}")
+                    
+                    // Also tag as latest
+                    sh "docker tag ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${BUILD_NUMBER} ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest"
+                }
+            }
+        }
+        
+        stage('Push to ACR') {
+            steps {
+                script {
+                    // Login to Azure Container Registry
+                    sh """
+                        az login --service-principal \
+                            --username ${AZURE_CLIENT_ID} \
+                            --password ${AZURE_CLIENT_SECRET} \
+                            --tenant ${AZURE_TENANT_ID}
+                        az acr login --name ${ACR_NAME}
+                    """
+                    
+                    // Push image
+                    sh "docker push ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${BUILD_NUMBER}"
+                    sh "docker push ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:latest"
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    // Deploy to staging namespace using Ansible
+                    sh """
+                        ansible-playbook ansible/playbook.yml \
+                            -e acr_name=${ACR_NAME} \
+                            -e image_tag=${BUILD_NUMBER} \
+                            -e namespace=staging \
+                            -e mongodb_connection=\${MONGODB_STAGING_CONNECTION}
+                    """
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    // Wait for deployment and run integration tests
+                    sleep 30
+                    sh 'npm run test:integration -- --env=staging'
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // Manual approval for production deployment
+                    input message: 'Deploy to production?', ok: 'Deploy'
+                    
+                    // Deploy to production using Ansible
+                    sh """
+                        ansible-playbook ansible/playbook.yml \
+                            -e acr_name=${ACR_NAME} \
+                            -e image_tag=${BUILD_NUMBER} \
+                            -e namespace=production \
+                            -e mongodb_connection=\${MONGODB_PROD_CONNECTION}
+                    """
+                }
+            }
+        }
+        
+        stage('Production Health Check') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // Wait and perform health check
+                    sleep 60
+                    sh '''
+                        for i in {1..10}; do
+                            if curl -f https://api.yourdomain.com/health; then
+                                echo "Health check passed"
+                                exit 0
+                            fi
+                            echo "Health check failed, retry $i/10"
+                            sleep 10
+                        done
+                        exit 1
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up
+            sh 'docker system prune -f'
+            
+            // Archive test results
+            publishTestResults testResultsPattern: 'test-results.xml'
+            
+            // Archive artifacts
+            archiveArtifacts artifacts: 'package.json,Dockerfile', fingerprint: true
+        }
+        
+        success {
+            // Send success notification
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: "✅ Deployment successful: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            )
+        }
+        
+        failure {
+            // Send failure notification
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ Deployment failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            )
+        }
+    }
+}

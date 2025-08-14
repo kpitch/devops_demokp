@@ -1,0 +1,126 @@
+---
+- name: Deploy application to Kubernetes
+  hosts: localhost
+  connection: local
+  vars:
+    acr_name: "{{ acr_name }}"
+    image_tag: "{{ image_tag | default('latest') }}"
+    namespace: "{{ namespace | default('default') }}"
+    mongodb_connection: "{{ mongodb_connection }}"
+    
+  tasks:
+    - name: Create namespace if not exists
+      kubernetes.core.k8s:
+        name: "{{ namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Create MongoDB secret
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mongodb-secret
+            namespace: "{{ namespace }}"
+          type: Opaque
+          data:
+            connection-string: "{{ mongodb_connection | b64encode }}"
+
+    - name: Create ACR secret
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: acr-secret
+            namespace: "{{ namespace }}"
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: "{{ acr_docker_config | b64encode }}"
+
+    - name: Deploy application
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: myapi-deployment
+            namespace: "{{ namespace }}"
+            labels:
+              app: myapi
+          spec:
+            replicas: 3
+            selector:
+              matchLabels:
+                app: myapi
+            template:
+              metadata:
+                labels:
+                  app: myapi
+              spec:
+                containers:
+                - name: myapi
+                  image: "{{ acr_name }}.azurecr.io/myapi:{{ image_tag }}"
+                  ports:
+                  - containerPort: 3000
+                  env:
+                  - name: NODE_ENV
+                    value: "production"
+                  - name: MONGODB_URI
+                    valueFrom:
+                      secretKeyRef:
+                        name: mongodb-secret
+                        key: connection-string
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 3000
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 3000
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                  resources:
+                    requests:
+                      cpu: 100m
+                      memory: 128Mi
+                    limits:
+                      cpu: 500m
+                      memory: 256Mi
+                imagePullSecrets:
+                - name: acr-secret
+
+    - name: Create service
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: myapi-service
+            namespace: "{{ namespace }}"
+          spec:
+            selector:
+              app: myapi
+            ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 3000
+            type: ClusterIP
+
+    - name: Wait for deployment
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: myapi-deployment
+        namespace: "{{ namespace }}"
+        wait_condition:
+          type: Progressing
+          status: "True"
+          reason: NewReplicaSetAvailable
+        wait_sleep: 10
+        wait_timeout: 600
